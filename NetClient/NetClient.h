@@ -1,17 +1,20 @@
 #pragma once
-#include <MSWSock.h>
 #include <WinSock2.h>
+#include <MSWSock.h>
 #include <windows.h>
 #include <mutex>
-#include "CLockFreeQueue.h"
-#include "CLockFreeStack.h"
-#include "Session.h"
-#include "IClientHandler.h"
 
-class NetClient : public IClientHandler
+struct Session;
+
+class SmartPacket;
+class Packet;
+struct Session;
+#include "CLockFreeStack.h"
+
+class NetClient
 {
 	NetClient();
-	~NetClient();
+	virtual ~NetClient();
 	bool Start();
 	void InitialConnect();
 	void SendPacket(ULONGLONG id, SmartPacket& sendPacket);
@@ -21,6 +24,7 @@ class NetClient : public IClientHandler
 	virtual void OnConnect(ULONGLONG id) = 0;
 	virtual void OnRelease(ULONGLONG id) = 0;
 	virtual void OnConnectFailed() = 0;
+	void Disconnect(ULONGLONG id);
 private:
 	bool ConnectPost(Session* pSession);
 	bool DisconnectExPost(Session* pSession);
@@ -33,7 +37,6 @@ private:
 	void DisconnectProc(Session* pSession);
 	friend class Packet;
 	static unsigned __stdcall IOCPWorkerThread(LPVOID arg);
-	static void InitSharedElement();
 
 	DWORD IOCP_WORKER_THREAD_NUM_ = 0;
 	DWORD IOCP_ACTIVE_THREAD_NUM_;
@@ -44,8 +47,13 @@ private:
 	HANDLE* hIOCPWorkerThreadArr_;
 	CLockFreeStack<short> DisconnectStack_;
 	HANDLE hcp_;
-	std::once_flag onceFlag_;
 	LPFN_CONNECTEX lpfnConnectExPtr_;
 	LPFN_DISCONNECTEX lpfnDisconnectExPtr_;
 	SOCKADDR_IN sockAddr_;
 };
+
+#include "Packet.h"
+#include "CLockFreeQueue.h"
+#include "RingBuffer.h"
+#include "MYOVERLAPPED.h"
+#include "Session.h"

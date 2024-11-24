@@ -1,9 +1,10 @@
-#include <locale>
 #include <WS2tcpip.h>
-#include <mutex>
+#include <locale>
+
 #include "NetClient.h"
 #include "Logger.h"
 #include "Parser.h"
+
 #pragma comment(lib,"LoggerMT.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib,"TextParser.lib")
@@ -13,6 +14,27 @@ bool WsaIoctlWrapper(SOCKET sock, GUID guid, LPVOID* pFuncPtr)
 {
 	DWORD bytes = 0;
 	return SOCKET_ERROR != WSAIoctl(sock, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), pFuncPtr, sizeof(*pFuncPtr), &bytes, NULL, NULL);
+}
+
+void NetClient::SendProc(Session* pSession, DWORD dwNumberOfBytesTransferred)
+{
+	if (pSession->bDisconnectCalled_ == true)
+		return;
+
+	LONG sendBufNum = pSession->lSendBufNum_;
+	pSession->lSendBufNum_ = 0;
+	for (LONG i = 0; i < sendBufNum; ++i)
+	{
+		Packet* pPacket = pSession->pSendPacketArr_[i];
+		if (pPacket->DecrementRefCnt() == 0)
+		{
+			PACKET_FREE(pPacket);
+		}
+	}
+
+	InterlockedExchange((LONG*)&pSession->bSendingInProgress_, FALSE);
+	if (pSession->sendPacketQ_.GetSize() > 0)
+		SendPost(pSession);
 }
 
 void NetClient::ConnectProc(Session* pSession)
@@ -344,12 +366,50 @@ void NetClient::SendPacket_ALREADY_ENCODED(ULONGLONG id, Packet* pPacket)
 }
 
 
+void NetClient::Disconnect(ULONGLONG id)
+{
+	Session* pSession = pSessionArr_ + Session::GET_SESSION_INDEX(id);
+	long IoCnt = InterlockedIncrement(&pSession->IoCnt_);
+
+	// RELEASE진행중 혹은 진행완료
+	if ((IoCnt & Session::RELEASE_FLAG) == Session::RELEASE_FLAG)
+	{
+		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
+			ReleaseSession(pSession);
+		return;
+	}
+
+	// RELEASE후 재활용까지 되엇을때
+	if (id != pSession->id_)
+	{
+		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
+			ReleaseSession(pSession);
+		return;
+	}
+
+	// Disconnect 1회 제한
+	if ((bool)InterlockedExchange((LONG*)&pSession->bDisconnectCalled_, true) == true)
+	{
+		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
+			ReleaseSession(pSession);
+		return;
+	}
+
+	// 여기 도달햇다면 같은 세션에 대해서 RELEASE 조차 호출되지 않은상태임이 보장된다
+	CancelIoEx((HANDLE)pSession->sock_, nullptr);
+
+	// CancelIoEx호출로 인해서 RELEASE가 호출되엇어야 햇지만 위에서의 InterlockedIncrement 때문에 호출이 안된 경우 업보청산
+	if (InterlockedDecrement(&pSession->IoCnt_) == 0)
+		ReleaseSession(pSession);
+}
+
 bool NetClient::ConnectPost(Session* pSession)
 {
 	if (pSession->bDisconnectCalled_ == true)
 		return true;
 
 	InterlockedIncrement(&pSession->IoCnt_);
+	ZeroMemory(&pSession->sendOverlapped.overlapped, sizeof(WSAOVERLAPPED));
 	pSession->sendOverlapped.why = OVERLAPPED_REASON::CONNECT;
 	BOOL bConnectExRet = lpfnConnectExPtr_(pSession->sock_, (SOCKADDR*)&sockAddr_, sizeof(sockAddr_), nullptr, 0, NULL, (LPOVERLAPPED)&pSession->sendOverlapped);
 	if (bConnectExRet == FALSE)
@@ -376,6 +436,7 @@ bool NetClient::ConnectPost(Session* pSession)
 bool NetClient::DisconnectExPost(Session* pSession)
 {
 	InterlockedIncrement(&pSession->IoCnt_);
+	ZeroMemory(&(pSession->sendOverlapped.overlapped), sizeof(WSAOVERLAPPED));
 	pSession->sendOverlapped.why = OVERLAPPED_REASON::DISCONNECT;
 	BOOL bDisconnectExRet = lpfnDisconnectExPtr_(pSession->sock_, (LPOVERLAPPED)&pSession->sendOverlapped, TF_REUSE_SOCKET, 0);
 	if (bDisconnectExRet == FALSE)
@@ -496,5 +557,55 @@ void NetClient::ReleaseSession(Session* pSession)
 		return;
 
 	DisconnectExPost(pSession);
+}
+
+void NetClient::RecvProc(Session* pSession, int numberOfBytesTransferred)
+{
+	using NetHeader = Packet::NetHeader;
+	pSession->recvRB_.MoveInPos(numberOfBytesTransferred);
+	while (1)
+	{
+		if (pSession->bDisconnectCalled_ == true)
+			return;
+
+		Packet::NetHeader header;
+		if (pSession->recvRB_.Peek((char*)&header, sizeof(NetHeader)) == 0)
+			break;
+
+		if (header.code_ != Packet::PACKET_CODE)
+		{
+			Disconnect(pSession->id_);
+			return;
+		}
+
+		if (pSession->recvRB_.GetUseSize() < sizeof(NetHeader) + header.payloadLen_)
+		{
+			if (header.payloadLen_ > BUFFER_SIZE)
+			{
+				Disconnect(pSession->id_);
+				return;
+			}
+			break;
+		}
+
+		pSession->recvRB_.MoveOutPos(sizeof(NetHeader));
+
+		Packet* pPacket = PACKET_ALLOC(Net);
+		pSession->recvRB_.Dequeue(pPacket->GetPayloadStartPos<Net>(), header.payloadLen_);
+		pPacket->MoveWritePos(header.payloadLen_);
+		memcpy(pPacket->pBuffer_, &header, sizeof(Packet::NetHeader));
+
+		// 넷서버에서만 호출되는 함수로 검증 및 디코드후 체크섬 확인
+		if (pPacket->ValidateReceived() == false)
+		{
+			PACKET_FREE(pPacket);
+			Disconnect(pSession->id_);
+			return;
+		}
+
+		pSession->lastRecvTime = GetTickCount64();
+		OnRecv(pSession->id_, pPacket);
+	}
+	RecvPost(pSession);
 }
 

@@ -1,16 +1,18 @@
 #pragma once
 #include <memory.h>
-#include "CLockFreeQueue.h"
 #include <stddef.h>
 #include <list>
-#include "Session.h"
+#include "CLockFreeQueue.h"
+//#include "Session.h"
+
 
 #define QUEUE
 #include "CTlsObjectPool.h"
 #include "Logger.h"
-
+#include "NetClient.h"
 
 //#define DEBUG_LEAK
+struct Session;
 
 using NET_HEADER = short;
 

@@ -18,9 +18,6 @@
     <ClInclude Include="NetClient.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
-    <ClInclude Include="IClientHandler.h">
-      <Filter>헤더 파일</Filter>
-    </ClInclude>
     <ClInclude Include="Session.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
