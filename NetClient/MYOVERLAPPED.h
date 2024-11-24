@@ -1,0 +1,16 @@
+#pragma once
+enum class OVERLAPPED_REASON
+{
+	SEND,
+	RECV,
+	POST,
+	CONNECT,
+	DISCONNECT
+};
+
+struct MYOVERLAPPED
+{
+	WSAOVERLAPPED overlapped;
+	OVERLAPPED_REASON why;
+};
+
