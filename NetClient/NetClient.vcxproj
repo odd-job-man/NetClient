@@ -144,7 +144,6 @@
     <ClInclude Include="Session.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="NetClient.cpp" />
     <ClCompile Include="RingBuffer.cpp" />
   </ItemGroup>

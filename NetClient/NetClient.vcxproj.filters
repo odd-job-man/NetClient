@@ -56,9 +56,6 @@
     <ClCompile Include="RingBuffer.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="main.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
     <ClCompile Include="NetClient.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
