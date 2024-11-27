@@ -55,7 +55,7 @@ public:
 	}
 
 	std::optional<T> Pop()
-	{
+{
 		Node* realTop;
 		uintptr_t metaTop;
 		uintptr_t newMetaTop;

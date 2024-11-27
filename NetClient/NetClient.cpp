@@ -5,6 +5,8 @@
 #include "Logger.h"
 #include "Parser.h"
 
+#include "MemLog.h"
+
 #pragma comment(lib,"LoggerMT.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib,"TextParser.lib")
@@ -18,9 +20,10 @@ bool WsaIoctlWrapper(SOCKET sock, GUID guid, LPVOID* pFuncPtr)
 
 void NetClient::SendProc(Session* pSession, DWORD dwNumberOfBytesTransferred)
 {
-	if (pSession->bDisconnectCalled_ == true)
+	if (pSession->bDisconnectCalled_ == TRUE)
 		return;
 
+	MEMORY_LOG(SEND_PROC, pSession->id_);
 	LONG sendBufNum = pSession->lSendBufNum_;
 	pSession->lSendBufNum_ = 0;
 	for (LONG i = 0; i < sendBufNum; ++i)
@@ -31,7 +34,6 @@ void NetClient::SendProc(Session* pSession, DWORD dwNumberOfBytesTransferred)
 			PACKET_FREE(pPacket);
 		}
 	}
-
 	InterlockedExchange((LONG*)&pSession->bSendingInProgress_, FALSE);
 	if (pSession->sendPacketQ_.GetSize() > 0)
 		SendPost(pSession);
@@ -39,13 +41,24 @@ void NetClient::SendProc(Session* pSession, DWORD dwNumberOfBytesTransferred)
 
 void NetClient::ConnectProc(Session* pSession)
 {
+	MEMORY_LOG(CONNECT_PROC, pSession->id_);
+	InterlockedIncrement(&pSession->IoCnt_);
+	InterlockedAnd(&pSession->IoCnt_, ~Session::RELEASE_FLAG);
+
 	setsockopt(pSession->sock_, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+	//SetZeroCopy(pSession->sock_);
+	//SetLinger(pSession->sock_);
+	//SetReuseAddr(pSession->sock_);
+
 	pSession->Init(InterlockedIncrement(&ullIdCounter_) - 1, (short)(pSession - pSessionArr_));
+
+	OnConnect(pSession->id_);
 	RecvPost(pSession);
 }
 
 void NetClient::DisconnectProc(Session* pSession)
 {
+	MEMORY_LOG(DISCONNECT_PROC, pSession->id_);
 	// Release 될 Session의 직렬화 버퍼 정리
 	for (LONG i = 0; i < pSession->lSendBufNum_; ++i)
 	{
@@ -76,6 +89,7 @@ void NetClient::DisconnectProc(Session* pSession)
 
 unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 {
+	srand(time(nullptr));
 	NetClient* pNetClient = (NetClient*)arg;
 	while (1)
 	{
@@ -83,25 +97,33 @@ unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 		DWORD dwNOBT = 0;
 		Session* pSession = nullptr;
 		bool bContinue = false;
+		bool bConnectSuccess = true;
 		BOOL bGQCSRet = GetQueuedCompletionStatus(pNetClient->hcp_, &dwNOBT, (PULONG_PTR)&pSession, (LPOVERLAPPED*)&pOverlapped, INFINITE);
 		do
 		{
 			if (!pOverlapped && !dwNOBT && !pSession)
 				return 0;
 
-			// 최초 Disconnect를 호출하지 않은 상태에서 Connect를 시도햇는데 실패한 경우 다시 보내기 위함임
-			if (bGQCSRet && dwNOBT == 0)
-			{
-				if (pOverlapped->why == OVERLAPPED_REASON::CONNECT)
-					pNetClient->OnConnectFailed();
-				break;
-			}
-
 			if (!bGQCSRet && pOverlapped)
 			{
+				DWORD errCode = WSAGetLastError();
 				if (pOverlapped->why == OVERLAPPED_REASON::CONNECT)
-					pNetClient->OnConnectFailed();
-				break;
+				{
+					bContinue = true;
+					pNetClient->OnConnectFailed(pSession->id_);
+					pNetClient->DisconnectStack_.Push((short)(pSession - pNetClient->pSessionArr_));
+					if (errCode != 0)
+						LOG(L"ERROR", ERR, TEXTFILE, L"ConnectEx Failed ErrCode : %u", WSAGetLastError());
+					continue;
+				}
+				else if (pOverlapped->why == OVERLAPPED_REASON::DISCONNECT)
+				{
+					bContinue = true;
+					LOG(L"ERROR", ERR, TEXTFILE, L"DisconnectEx Failed ErrCode : %u", WSAGetLastError());
+					__debugbreak();
+				}
+				else
+					break;
 			}
 
 			switch (pOverlapped->why)
@@ -110,7 +132,11 @@ unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 				pNetClient->SendProc(pSession, dwNOBT);
 				break;
 			case OVERLAPPED_REASON::RECV:
-				pNetClient->RecvProc(pSession, dwNOBT);
+				if (!(bGQCSRet && dwNOBT == 0))
+				{
+					pNetClient->RecvProc(pSession, dwNOBT);
+					pNetClient->TempLanRecvProc(pSession, dwNOBT);
+				}
 				break;
 			case OVERLAPPED_REASON::POST:
 				break;
@@ -118,6 +144,7 @@ unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 				pNetClient->ConnectProc(pSession);
 				break;
 			case OVERLAPPED_REASON::DISCONNECT:
+				bContinue = true;
 				pNetClient->DisconnectProc(pSession);
 				break;
 			default:
@@ -130,10 +157,50 @@ unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 			continue;
 
 		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
+		{
 			pNetClient->ReleaseSession(pSession);
+		}
 	}
 	return 0;
 }
+
+bool NetClient::SetLinger(SOCKET sock)
+{
+	linger linger;
+	linger.l_linger = 0;
+	linger.l_onoff = 1;
+	return setsockopt(sock, SOL_SOCKET, SO_LINGER, (char*)&linger, sizeof(linger)) == 0;
+}
+
+bool NetClient::SetZeroCopy(SOCKET sock)
+{
+	DWORD dwSendBufSize = 0;
+	return setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&dwSendBufSize, sizeof(dwSendBufSize)) == 0;
+}
+
+bool NetClient::SetReuseAddr(SOCKET sock)
+{
+	DWORD option = 1;
+	return setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&option, sizeof(option)) == 0;
+}
+
+bool NetClient::SetClientBind(SOCKET sock)
+{
+	SOCKADDR_IN addr;
+	ZeroMemory(&addr, sizeof(SOCKADDR_IN));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = ::htonl(INADDR_ANY);
+	addr.sin_port = ::htons(0);
+
+	if (bind(sock, reinterpret_cast<const SOCKADDR*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+	{
+		DWORD errCode = WSAGetLastError();
+		__debugbreak();
+		return false;
+	}
+	return true;
+}
+
 
 NetClient::NetClient()
 {
@@ -172,7 +239,8 @@ NetClient::NetClient()
 	InetPtonW(AF_INET, ipStr, &sockAddr_.sin_addr);
 
 	GetValue(psr, L"BIND_PORT", (PVOID*)&pStart, nullptr);
-	sockAddr_.sin_port= (short)_wtoi((LPCWSTR)pStart);
+	short SERVER_PORT = (short)_wtoi((LPCWSTR)pStart);
+	sockAddr_.sin_port = htons(SERVER_PORT);
 
 	GetValue(psr, L"IOCP_WORKER_THREAD", (PVOID*)&pStart, nullptr);
 	IOCP_WORKER_THREAD_NUM_ = (DWORD)_wtoi((LPCWSTR)pStart);
@@ -211,47 +279,28 @@ NetClient::NetClient()
 	for (int i = maxSession_ - 1; i >= 0; --i)
 		DisconnectStack_.Push(i);
 
-
-
 	// 소켓미리 생성
 	for (int i = 0; i < maxSession_; ++i)
 	{
-		pSessionArr_[i].sock_ = socket(AF_INET, SOCK_STREAM, 0);
-		if (pSessionArr_[i].sock_ == INVALID_SOCKET)
+		Session* pSession = pSessionArr_ + i;
+		pSession->sock_  = socket(AF_INET, SOCK_STREAM, 0);
+		if (pSession->sock_ == INVALID_SOCKET)
 			__debugbreak();
 
+		SetClientBind(pSession->sock_);
+		SetZeroCopy(pSession->sock_);
+		SetLinger(pSession->sock_);
+		SetReuseAddr(pSession->sock_);
+
 		// IOCP에 소켓을 미리 등록해두기 CompletionKey는 sock_이 선언된 Session, 나중에 ConnectEx나 DisconnectEx가 호출되면 사용
-		CreateIoCompletionPort((HANDLE)pSessionArr_[i].sock_, hcp_, (ULONG_PTR)pSessionArr_ + i, 0);
-	}
-
-	linger linger;
-	linger.l_linger = 0;
-	linger.l_onoff = 1;
-	for (int i = 0; i < maxSession_; ++i)
-	{
-		setsockopt(pSessionArr_[i].sock_, SOL_SOCKET, SO_LINGER, (char*)&linger, sizeof(linger));
-	}
-	LOG(L"ONOFF", SYSTEM, TEXTFILE, L"linger() OK");
-
-	if (bZeroByteSend == 1)
-	{
-		for (int i = 0; i < maxSession_; ++i)
-		{
-			DWORD dwSendBufSize = 0;
-			setsockopt(pSessionArr_[i].sock_, SOL_SOCKET, SO_SNDBUF, (char*)&dwSendBufSize, sizeof(dwSendBufSize));
-		}
-		LOG(L"ONOFF", SYSTEM, TEXTFILE, L"ZeroByte Send OK");
-	}
-	else
-	{
-		LOG(L"ONOFF", SYSTEM, TEXTFILE, L"NO ZeroByte Send");
+		CreateIoCompletionPort((HANDLE)pSession->sock_, hcp_, (ULONG_PTR)pSession, 0);
 	}
 
 	// IOCP 워커스레드 생성(CREATE_SUSPENDED)
 	hIOCPWorkerThreadArr_ = new HANDLE[IOCP_WORKER_THREAD_NUM_];
 	for (DWORD i = 0; i < IOCP_WORKER_THREAD_NUM_; ++i)
 	{
-		hIOCPWorkerThreadArr_[i] = (HANDLE)_beginthreadex(NULL, 0, IOCPWorkerThread, nullptr, CREATE_SUSPENDED, nullptr);
+		hIOCPWorkerThreadArr_[i] = (HANDLE)_beginthreadex(NULL, 0, IOCPWorkerThread, this, CREATE_SUSPENDED, nullptr);
 		if (!hIOCPWorkerThreadArr_[i])
 		{
 			LOG(L"ONOFF", SYSTEM, TEXTFILE, L"MAKE WorkerThread Fail ErrCode : %u", WSAGetLastError());
@@ -266,28 +315,6 @@ NetClient::~NetClient()
 	WSACleanup();
 }
 
-bool NetClient::Start()
-{
-	short idx = DisconnectStack_.Pop().value();
-	Session* pSession = pSessionArr_ + idx;
-
-	pSession->Init(ullIdCounter_, idx);
-	pSession->sendOverlapped.why = OVERLAPPED_REASON::CONNECT;
-	++ullIdCounter_;
-
-	BOOL bConnectExRet = lpfnConnectExPtr_(pSession->sock_, (SOCKADDR*)&sockAddr_, sizeof(sockAddr_), nullptr, 0, NULL, (LPOVERLAPPED)&pSession->sendOverlapped);
-	if (bConnectExRet == FALSE)
-	{
-		DWORD errCode = WSAGetLastError();
-		if (errCode != WSA_IO_PENDING)
-		{
-			LOG(L"ERROR", ERR, TEXTFILE, L"ConnectEx ErrCode : %u", errCode);
-			__debugbreak();
-			return false;
-		}
-	}
-	return true;
-}
 
 void NetClient::InitialConnect()
 {
@@ -298,11 +325,9 @@ void NetClient::InitialConnect()
 			return;
 
 		Session* pSession = pSessionArr_ + opt.value();
-		InterlockedIncrement(&pSession->IoCnt_);
-		InterlockedAnd(&pSession->IoCnt_, ~Session::RELEASE_FLAG);
+		//InterlockedExchange((LONG*)&pSession->bDisconnectCalled_, FALSE);
+
 		ConnectPost(pSession);
-		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
-			ReleaseSession(pSession);
 	}
 }
 
@@ -368,6 +393,7 @@ void NetClient::SendPacket_ALREADY_ENCODED(ULONGLONG id, Packet* pPacket)
 
 void NetClient::Disconnect(ULONGLONG id)
 {
+	MEMORY_LOG(DISCONNECT, id);
 	Session* pSession = pSessionArr_ + Session::GET_SESSION_INDEX(id);
 	long IoCnt = InterlockedIncrement(&pSession->IoCnt_);
 
@@ -388,7 +414,8 @@ void NetClient::Disconnect(ULONGLONG id)
 	}
 
 	// Disconnect 1회 제한
-	if ((bool)InterlockedExchange((LONG*)&pSession->bDisconnectCalled_, true) == true)
+
+	if (InterlockedExchange((LONG*)&pSession->bDisconnectCalled_, TRUE) == TRUE)
 	{
 		if (InterlockedDecrement(&pSession->IoCnt_) == 0)
 			ReleaseSession(pSession);
@@ -396,7 +423,8 @@ void NetClient::Disconnect(ULONGLONG id)
 	}
 
 	// 여기 도달햇다면 같은 세션에 대해서 RELEASE 조차 호출되지 않은상태임이 보장된다
-	CancelIoEx((HANDLE)pSession->sock_, nullptr);
+	CancelIoEx((HANDLE)pSession->sock_, &pSession->sendOverlapped.overlapped);
+	CancelIoEx((HANDLE)pSession->sock_, &pSession->recvOverlapped.overlapped);
 
 	// CancelIoEx호출로 인해서 RELEASE가 호출되엇어야 햇지만 위에서의 InterlockedIncrement 때문에 호출이 안된 경우 업보청산
 	if (InterlockedDecrement(&pSession->IoCnt_) == 0)
@@ -405,47 +433,36 @@ void NetClient::Disconnect(ULONGLONG id)
 
 bool NetClient::ConnectPost(Session* pSession)
 {
-	if (pSession->bDisconnectCalled_ == true)
-		return true;
-
-	InterlockedIncrement(&pSession->IoCnt_);
-	ZeroMemory(&pSession->sendOverlapped.overlapped, sizeof(WSAOVERLAPPED));
-	pSession->sendOverlapped.why = OVERLAPPED_REASON::CONNECT;
-	BOOL bConnectExRet = lpfnConnectExPtr_(pSession->sock_, (SOCKADDR*)&sockAddr_, sizeof(sockAddr_), nullptr, 0, NULL, (LPOVERLAPPED)&pSession->sendOverlapped);
+	ZeroMemory(&pSession->connectOverlapped.overlapped, sizeof(WSAOVERLAPPED));
+	pSession->connectOverlapped.why = OVERLAPPED_REASON::CONNECT;
+	BOOL bConnectExRet = lpfnConnectExPtr_(pSession->sock_, (SOCKADDR*)&sockAddr_, sizeof(SOCKADDR_IN), nullptr, 0, NULL, &pSession->connectOverlapped.overlapped);
 	if (bConnectExRet == FALSE)
 	{
 		DWORD errCode = WSAGetLastError();
 		if (errCode == WSA_IO_PENDING)
-		{
-			if (pSession->bDisconnectCalled_ == true)
-			{
-				CancelIoEx((HANDLE)pSession->sock_, nullptr);
-				return false;
-			}
 			return true;
-		}
 
-		InterlockedDecrement(&pSession->IoCnt_);
-		OnConnectFailed();
+		OnConnectFailed(pSession->id_);
+		DisconnectStack_.Push((short)(pSession - pSessionArr_));
 		LOG(L"ERROR", ERR, TEXTFILE, L"ConnectEx ErrCode : %u", errCode);
 		__debugbreak();
 		return false;
 	}
+	return true;
 }
 
 bool NetClient::DisconnectExPost(Session* pSession)
 {
-	InterlockedIncrement(&pSession->IoCnt_);
-	ZeroMemory(&(pSession->sendOverlapped.overlapped), sizeof(WSAOVERLAPPED));
-	pSession->sendOverlapped.why = OVERLAPPED_REASON::DISCONNECT;
-	BOOL bDisconnectExRet = lpfnDisconnectExPtr_(pSession->sock_, (LPOVERLAPPED)&pSession->sendOverlapped, TF_REUSE_SOCKET, 0);
+	MEMORY_LOG(DISCONNECTEX_POST, pSession->id_);
+	ZeroMemory(&(pSession->disconnectOverlapped.overlapped), sizeof(WSAOVERLAPPED));
+	pSession->disconnectOverlapped.why = OVERLAPPED_REASON::DISCONNECT;
+	BOOL bDisconnectExRet = lpfnDisconnectExPtr_(pSession->sock_, &pSession->disconnectOverlapped.overlapped, TF_REUSE_SOCKET, 0);
 	if (bDisconnectExRet == FALSE)
 	{
 		DWORD errCode = WSAGetLastError();
 		if (errCode == WSA_IO_PENDING)
 			return true;
 
-		InterlockedDecrement(&pSession->IoCnt_);
 		LOG(L"ERROR", ERR, TEXTFILE, L"DisconnectEx ErrCode : %u", errCode);
 		__debugbreak();
 		return false;
@@ -455,7 +472,7 @@ bool NetClient::DisconnectExPost(Session* pSession)
 
 BOOL NetClient::SendPost(Session* pSession)
 {
-	if (pSession->bDisconnectCalled_ == true)
+	if (pSession->bDisconnectCalled_ == TRUE)
 		return TRUE;
 
 	// 현재 값을 TRUE로 바꾼다. 원래 TRUE엿다면 반환값이 TRUE일것이며 그렇다면 현재 SEND 진행중이기 때문에 그냥 빠저나간다
@@ -480,7 +497,8 @@ BOOL NetClient::SendPost(Session* pSession)
 	{
 		Packet* pPacket = pSession->sendPacketQ_.Dequeue().value();
 		wsa[i].buf = (char*)pPacket->pBuffer_;
-		wsa[i].len = pPacket->GetUsedDataSize() + sizeof(Packet::NetHeader);
+		//wsa[i].len = pPacket->GetUsedDataSize() + sizeof(Packet::NetHeader);
+		wsa[i].len = pPacket->GetUsedDataSize() + sizeof(Packet::LanHeader);
 		pSession->pSendPacketArr_[i] = pPacket;
 	}
 
@@ -488,15 +506,15 @@ BOOL NetClient::SendPost(Session* pSession)
 	InterlockedIncrement(&pSession->IoCnt_);
 	ZeroMemory(&(pSession->sendOverlapped.overlapped), sizeof(WSAOVERLAPPED));
 	pSession->sendOverlapped.why = OVERLAPPED_REASON::SEND;
-	int iSendRet = WSASend(pSession->sock_, wsa, i, nullptr, 0, (LPWSAOVERLAPPED) & (pSession->sendOverlapped), nullptr);
+	int iSendRet = WSASend(pSession->sock_, wsa, i, nullptr, 0, &pSession->sendOverlapped.overlapped, nullptr);
 	if (iSendRet == SOCKET_ERROR)
 	{
 		DWORD dwErrCode = WSAGetLastError();
 		if (dwErrCode == WSA_IO_PENDING)
 		{
-			if (pSession->bDisconnectCalled_ == true)
+			if (pSession->bDisconnectCalled_ == TRUE)
 			{
-				CancelIoEx((HANDLE)pSession->sock_, nullptr);
+				CancelIoEx((HANDLE)pSession->sock_, &pSession->sendOverlapped.overlapped);
 				return FALSE;
 			}
 			return TRUE;
@@ -514,7 +532,7 @@ BOOL NetClient::SendPost(Session* pSession)
 
 BOOL NetClient::RecvPost(Session* pSession)
 {
-	if (pSession->bDisconnectCalled_ == true)
+	if (pSession->bDisconnectCalled_ == TRUE)
 		return FALSE;
 
 	WSABUF wsa[2];
@@ -523,19 +541,19 @@ BOOL NetClient::RecvPost(Session* pSession)
 	wsa[1].buf = pSession->recvRB_.Buffer_;
 	wsa[1].len = pSession->recvRB_.GetFreeSize() - wsa[0].len;
 
-	ZeroMemory(&pSession->recvOverlapped, sizeof(WSAOVERLAPPED));
+	ZeroMemory(&pSession->recvOverlapped.overlapped, sizeof(WSAOVERLAPPED));
 	pSession->recvOverlapped.why = OVERLAPPED_REASON::RECV;
 	DWORD flags = 0;
 	InterlockedIncrement(&pSession->IoCnt_);
-	int iRecvRet = WSARecv(pSession->sock_, wsa, 2, nullptr, &flags, (LPWSAOVERLAPPED) & (pSession->recvOverlapped), nullptr);
+	int iRecvRet = WSARecv(pSession->sock_, wsa, 2, nullptr, &flags, &pSession->recvOverlapped.overlapped, nullptr);
 	if (iRecvRet == SOCKET_ERROR)
 	{
 		DWORD dwErrCode = WSAGetLastError();
 		if (dwErrCode == WSA_IO_PENDING)
 		{
-			if (pSession->bDisconnectCalled_ == true)
+			if (pSession->bDisconnectCalled_ == TRUE)
 			{
-				CancelIoEx((HANDLE)pSession->sock_, nullptr);
+				CancelIoEx((HANDLE)pSession->sock_, &pSession->recvOverlapped.overlapped);
 				return FALSE;
 			}
 			return TRUE;
@@ -553,11 +571,13 @@ BOOL NetClient::RecvPost(Session* pSession)
 
 void NetClient::ReleaseSession(Session* pSession)
 {
+	MEMORY_LOG(RELEASE_SESSION, pSession->id_);
 	if (InterlockedCompareExchange(&pSession->IoCnt_, Session::RELEASE_FLAG | 0, 0) != 0)
 		return;
 
 	DisconnectExPost(pSession);
 }
+
 
 void NetClient::RecvProc(Session* pSession, int numberOfBytesTransferred)
 {
@@ -565,7 +585,7 @@ void NetClient::RecvProc(Session* pSession, int numberOfBytesTransferred)
 	pSession->recvRB_.MoveInPos(numberOfBytesTransferred);
 	while (1)
 	{
-		if (pSession->bDisconnectCalled_ == true)
+		if (pSession->bDisconnectCalled_ == TRUE)
 			return;
 
 		Packet::NetHeader header;
@@ -590,21 +610,52 @@ void NetClient::RecvProc(Session* pSession, int numberOfBytesTransferred)
 
 		pSession->recvRB_.MoveOutPos(sizeof(NetHeader));
 
-		Packet* pPacket = PACKET_ALLOC(Net);
-		pSession->recvRB_.Dequeue(pPacket->GetPayloadStartPos<Net>(), header.payloadLen_);
-		pPacket->MoveWritePos(header.payloadLen_);
-		memcpy(pPacket->pBuffer_, &header, sizeof(Packet::NetHeader));
+		SmartPacket sp = PACKET_ALLOC(Net);
+		pSession->recvRB_.Dequeue(sp->GetPayloadStartPos<Net>(), header.payloadLen_);
+		sp->MoveWritePos(header.payloadLen_);
+		memcpy(sp->pBuffer_, &header, sizeof(Packet::NetHeader));
 
 		// 넷서버에서만 호출되는 함수로 검증 및 디코드후 체크섬 확인
-		if (pPacket->ValidateReceived() == false)
+		if (sp->ValidateReceived() == false)
 		{
-			PACKET_FREE(pPacket);
 			Disconnect(pSession->id_);
 			return;
 		}
 
 		pSession->lastRecvTime = GetTickCount64();
-		OnRecv(pSession->id_, pPacket);
+		OnRecv(pSession->id_, sp.GetPacket());
+	}
+	RecvPost(pSession);
+}
+
+void NetClient::TempLanRecvProc(Session* pSession, int numberOfBytesTransferred)
+{
+	using LanHeader = Packet::LanHeader;
+	pSession->recvRB_.MoveInPos(numberOfBytesTransferred);
+	while (1)
+	{
+		if (pSession->bDisconnectCalled_ == TRUE)
+			return;
+
+		Packet::LanHeader header;
+		if (pSession->recvRB_.Peek((char*)&header, sizeof(LanHeader)) == 0)
+			break;
+
+		if (pSession->recvRB_.GetUseSize() < sizeof(LanHeader) + header.payloadLen_)
+			break;
+
+		SmartPacket sp = PACKET_ALLOC(Lan);
+
+		// 직렬화버퍼에 헤더내용쓰기
+		memcpy(sp->pBuffer_, &header, sizeof(Packet::LanHeader));
+		pSession->recvRB_.MoveOutPos(sizeof(LanHeader));
+
+		// 페이로드 직렬화버퍼로 빼기
+		pSession->recvRB_.Dequeue(sp->GetPayloadStartPos<Lan>(), header.payloadLen_);
+		sp->MoveWritePos(header.payloadLen_);
+
+		pSession->lastRecvTime = GetTickCount64();
+		OnRecv(pSession->id_, sp.GetPacket());
 	}
 	RecvPost(pSession);
 }

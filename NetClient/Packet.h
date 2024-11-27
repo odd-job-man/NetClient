@@ -64,7 +64,7 @@ public:
 	static inline unsigned char PACKET_CODE;
 	static inline unsigned char FIXED_KEY;
 	static constexpr int RINGBUFFER_SIZE = 10000;
-	int bufferSize_ = 300 + sizeof(NetHeader);
+	int bufferSize_ = 500 + sizeof(NetHeader);
 
 	bool Resize()
 	{

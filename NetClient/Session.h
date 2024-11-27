@@ -7,9 +7,11 @@ struct Session
 	ULONGLONG id_;
 	ULONGLONG lastRecvTime;
 	LONG lSendBufNum_;
-	bool bDisconnectCalled_;
-	MYOVERLAPPED recvOverlapped;
+	BOOL bDisconnectCalled_;
+	MYOVERLAPPED connectOverlapped;
 	MYOVERLAPPED sendOverlapped;
+	MYOVERLAPPED recvOverlapped;
+	MYOVERLAPPED disconnectOverlapped;
 	LONG IoCnt_;
 	CLockFreeQueue<Packet*> sendPacketQ_;
 	BOOL bSendingInProgress_;
@@ -20,7 +22,7 @@ struct Session
 		bSendingInProgress_ = FALSE;
 		InterlockedExchange(&id_, ((ullClientID << 16) ^ shIdx));
 		lastRecvTime = GetTickCount64();
-		bDisconnectCalled_ = false;
+		bDisconnectCalled_ = FALSE;
 		lSendBufNum_ = 0;
 		recvRB_.ClearBuffer();
 		return TRUE;

@@ -1,6 +1,6 @@
 #pragma once
 
-constexpr int BUFFER_SIZE = 1000;
+constexpr int BUFFER_SIZE = 10000;
 constexpr int ACTUAL_SIZE = BUFFER_SIZE + 1;
 
 #define GetDirectEnqueueSize_MACRO(in,out,iRet) do\
