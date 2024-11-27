@@ -33,7 +33,6 @@ protected:
 	BOOL RecvPost(Session* pSession);
 	void ReleaseSession(Session* pSession);
 	void RecvProc(Session* pSession, int numberOfBytesTransferred);
-	void TempLanRecvProc(Session* pSession, int numberOfBytesTransferred);
 	void SendProc(Session* pSession, DWORD dwNumberOfBytesTransferred);
 	void ConnectProc(Session* pSession);
 	void DisconnectProc(Session* pSession);

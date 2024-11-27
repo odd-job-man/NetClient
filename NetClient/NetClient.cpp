@@ -135,7 +135,6 @@ unsigned __stdcall NetClient::IOCPWorkerThread(LPVOID arg)
 				if (!(bGQCSRet && dwNOBT == 0))
 				{
 					pNetClient->RecvProc(pSession, dwNOBT);
-					pNetClient->TempLanRecvProc(pSession, dwNOBT);
 				}
 				break;
 			case OVERLAPPED_REASON::POST:
